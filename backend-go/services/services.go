@@ -658,17 +658,17 @@ func (s *AccessControlService) VehicleExit(licensePlate string, deviceID string,
 		duration := now.Sub(order.EntryTime)
 		minutes := int64(duration.Minutes())
 
-		billingService := NewBillingService(tx)
-		totalAmount, billingDetails, err := billingService.CalculateDetailedFee(order.EntryTime, now, "standard")
+		enhancedBillingService := NewEnhancedBillingService(tx)
+		billingResult, err := enhancedBillingService.CalculateParkingFee(order.EntryTime, now, "standard")
 		if err != nil {
 			return err
 		}
 
-		billingDetailsJSON, _ := json.Marshal(billingDetails)
+		billingDetailsJSON, _ := json.Marshal(billingResult)
 
 		order.ExitTime = &now
 		order.ParkingDuration = minutes
-		order.TotalAmount = totalAmount
+		order.TotalAmount = billingResult.FinalAmount
 		order.Status = "unpaid"
 		order.BillingDetails = string(billingDetailsJSON)
 

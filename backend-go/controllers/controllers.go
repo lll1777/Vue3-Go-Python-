@@ -539,12 +539,14 @@ func (c *AccessControlController) GetAccessLogs(ctx *gin.Context) {
 }
 
 type BillingController struct {
-	billingService *services.BillingService
+	billingService        *services.BillingService
+	enhancedBillingService *services.EnhancedBillingService
 }
 
 func NewBillingController(db *gorm.DB) *BillingController {
 	return &BillingController{
-		billingService: services.NewBillingService(db),
+		billingService:        services.NewBillingService(db),
+		enhancedBillingService: services.NewEnhancedBillingService(db),
 	}
 }
 
@@ -566,7 +568,7 @@ func (c *BillingController) CalculateFee(ctx *gin.Context) {
 		req.SpotType = "standard"
 	}
 
-	fee, err := c.billingService.CalculateFee(req.Minutes, req.SpotType)
+	fee, err := c.enhancedBillingService.CalculateFee(req.Minutes, req.SpotType)
 	if err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -628,7 +630,7 @@ func (c *BillingController) CalculateDetailedFee(ctx *gin.Context) {
 		req.SpotType = "standard"
 	}
 
-	totalAmount, periods, err := c.billingService.CalculateDetailedFee(entryTime, exitTime, req.SpotType)
+	result, err := c.enhancedBillingService.CalculateParkingFee(entryTime, exitTime, req.SpotType)
 	if err != nil {
 		ctx.JSON(http.StatusInternalServerError, gin.H{
 			"success": false,
@@ -638,25 +640,51 @@ func (c *BillingController) CalculateDetailedFee(ctx *gin.Context) {
 		return
 	}
 
-	periodsData := make([]gin.H, len(periods))
-	for i, p := range periods {
-		periodsData[i] = gin.H{
-			"start_time":   p.StartTime.Format(time.RFC3339),
-			"end_time":     p.EndTime.Format(time.RFC3339),
-			"duration_min": int64(p.Duration.Minutes()),
-			"period_type":  p.PeriodType,
-			"hourly_rate":  p.HourlyRate,
+	dailyBillingsJSON := make([]gin.H, len(result.DailyBillings))
+	for i, db := range result.DailyBillings {
+		periodsJSON := make([]gin.H, len(db.Periods))
+		for j, p := range db.Periods {
+			periodsJSON[j] = gin.H{
+				"start_time":     p.StartTime.Format(time.RFC3339),
+				"end_time":       p.EndTime.Format(time.RFC3339),
+				"duration":       p.Duration.String(),
+				"duration_min":   p.DurationMin,
+				"period_type":    p.PeriodType,
+				"hourly_rate":    p.HourlyRate,
+				"base_rate":      p.BaseRate,
+				"is_first_hour":  p.IsFirstHour,
+				"period_amount":  p.PeriodAmount,
+			}
+		}
+		dailyBillingsJSON[i] = gin.H{
+			"date":        db.Date,
+			"day_of_week": db.DayOfWeek,
+			"is_holiday":  db.IsHoliday,
+			"periods":     periodsJSON,
+			"sub_total":   db.SubTotal,
+			"daily_max":   db.DailyMax,
+			"discount":    db.Discount,
+			"daily_total": db.DailyTotal,
 		}
 	}
 
 	ctx.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"data": gin.H{
-			"entry_time":   entryTime.Format(time.RFC3339),
-			"exit_time":    exitTime.Format(time.RFC3339),
-			"total_amount": totalAmount,
-			"total_minutes": int64(exitTime.Sub(entryTime).Minutes()),
-			"periods":      periodsData,
+			"entry_time":           result.EntryTime.Format(time.RFC3339),
+			"exit_time":            result.ExitTime.Format(time.RFC3339),
+			"total_duration":       result.TotalDuration.String(),
+			"total_duration_min":   result.TotalDurationMin,
+			"within_grace_period":  result.WithinGracePeriod,
+			"grace_period_minutes": result.GracePeriodMinutes,
+			"daily_billings":       dailyBillingsJSON,
+			"first_hour_used":      result.FirstHourUsed,
+			"first_hour_applied":   result.FirstHourApplied,
+			"total_before_rules":   result.TotalBeforeRules,
+			"total_discount":       result.TotalDiscount,
+			"min_charge_applied":   result.MinChargeApplied,
+			"final_amount":         result.FinalAmount,
+			"rule_summary":         result.RuleSummary,
 		},
 	})
 }
