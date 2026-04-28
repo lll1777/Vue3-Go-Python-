@@ -246,6 +246,96 @@ func (c *ReservationController) CancelReservation(ctx *gin.Context) {
 	})
 }
 
+func (c *ReservationController) CheckInReservation(ctx *gin.Context) {
+	id := ctx.Param("id")
+
+	if err := c.reservationService.CheckInReservation(id); err != nil {
+		if err == services.ErrReservationExpired {
+			ctx.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": "Reservation has expired",
+				"error":   err.Error(),
+			})
+			return
+		}
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "Failed to check in reservation",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Reservation checked in successfully",
+	})
+}
+
+func (c *ReservationController) CheckOutReservation(ctx *gin.Context) {
+	id := ctx.Param("id")
+
+	if err := c.reservationService.CheckOutReservation(id); err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "Failed to check out reservation",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Reservation checked out successfully",
+	})
+}
+
+func (c *ReservationController) CleanupExpiredReservations(ctx *gin.Context) {
+	count, err := c.reservationService.CleanupExpiredReservations()
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "Failed to cleanup expired reservations",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Expired reservations cleaned up",
+		"data": gin.H{
+			"cleaned_count": count,
+		},
+	})
+}
+
+func (c *ReservationController) GetActiveReservationByPlate(ctx *gin.Context) {
+	licensePlate := ctx.Query("license_plate")
+	if licensePlate == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "License plate is required",
+		})
+		return
+	}
+
+	reservation, err := c.reservationService.GetActiveReservationByLicensePlate(licensePlate)
+	if err != nil {
+		ctx.JSON(http.StatusNotFound, gin.H{
+			"success": false,
+			"message": "No active reservation found",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data":    reservation,
+	})
+}
+
 type OrderController struct {
 	orderService *services.OrderService
 }
@@ -491,6 +581,82 @@ func (c *BillingController) CalculateFee(ctx *gin.Context) {
 		"data": gin.H{
 			"minutes": req.Minutes,
 			"fee":     fee,
+		},
+	})
+}
+
+func (c *BillingController) CalculateDetailedFee(ctx *gin.Context) {
+	var req struct {
+		EntryTime string `json:"entry_time" binding:"required"`
+		ExitTime  string `json:"exit_time" binding:"required"`
+		SpotType  string `json:"spot_type"`
+	}
+
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		ctx.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"message": "Invalid request body",
+		})
+		return
+	}
+
+	entryTime, err := time.Parse(time.RFC3339, req.EntryTime)
+	if err != nil {
+		entryTime, err = time.Parse("2006-01-02 15:04:05", req.EntryTime)
+		if err != nil {
+			ctx.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": "Invalid entry_time format",
+			})
+			return
+		}
+	}
+
+	exitTime, err := time.Parse(time.RFC3339, req.ExitTime)
+	if err != nil {
+		exitTime, err = time.Parse("2006-01-02 15:04:05", req.ExitTime)
+		if err != nil {
+			ctx.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"message": "Invalid exit_time format",
+			})
+			return
+		}
+	}
+
+	if req.SpotType == "" {
+		req.SpotType = "standard"
+	}
+
+	totalAmount, periods, err := c.billingService.CalculateDetailedFee(entryTime, exitTime, req.SpotType)
+	if err != nil {
+		ctx.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"message": "Failed to calculate detailed fee",
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	periodsData := make([]gin.H, len(periods))
+	for i, p := range periods {
+		periodsData[i] = gin.H{
+			"start_time":   p.StartTime.Format(time.RFC3339),
+			"end_time":     p.EndTime.Format(time.RFC3339),
+			"duration_min": int64(p.Duration.Minutes()),
+			"period_type":  p.PeriodType,
+			"hourly_rate":  p.HourlyRate,
+		}
+	}
+
+	ctx.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"entry_time":   entryTime.Format(time.RFC3339),
+			"exit_time":    exitTime.Format(time.RFC3339),
+			"total_amount": totalAmount,
+			"total_minutes": int64(exitTime.Sub(entryTime).Minutes()),
+			"periods":      periodsData,
 		},
 	})
 }
