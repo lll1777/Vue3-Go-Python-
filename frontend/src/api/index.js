@@ -141,6 +141,7 @@ export const deviceApi = {
 
 export const billingApi = {
   calculateFee: (data) => api.post('/billing/calculate', data),
+  calculateDetailedFee: (data) => api.post('/billing/calculate-detailed', data),
   getBillingRules: () => api.get('/billing/rules'),
   updateBillingRule: (id, data) => api.put(`/billing/rules/${id}`, data)
 }

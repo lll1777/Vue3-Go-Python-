@@ -1,11 +1,24 @@
 package services
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"math"
 	"parking-system-go/models"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
+)
+
+var (
+	ErrSpotNotAvailable = errors.New("parking spot is not available")
+	ErrSpotLocked       = errors.New("parking spot is locked")
+	ErrTimeConflict     = errors.New("parking spot has conflicting reservation")
+	ErrVersionMismatch  = errors.New("parking spot version mismatch, concurrent update detected")
+	ErrReservationExpired = errors.New("reservation has expired")
+	ErrNoActiveParking  = errors.New("no active parking record found")
 )
 
 type ParkingService struct {
@@ -57,14 +70,31 @@ func (s *ParkingService) GetParkingSpotByID(id string) (*models.ParkingSpot, err
 }
 
 func (s *ParkingService) UpdateParkingSpotStatus(id string, status string) error {
-	result := s.db.Model(&models.ParkingSpot{}).Where("id = ?", id).Update("status", status)
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return errors.New("parking spot not found")
-	}
-	return nil
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var spot models.ParkingSpot
+		if err := tx.First(&spot, "id = ?", id).Error; err != nil {
+			return err
+		}
+
+		oldVersion := spot.Version
+		spot.Status = status
+		spot.Version++
+
+		result := tx.Model(&spot).Where("id = ? AND version = ?", id, oldVersion).Updates(map[string]interface{}{
+			"status":   status,
+			"version":  spot.Version,
+			"updated_at": time.Now(),
+		})
+
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrVersionMismatch
+		}
+
+		return nil
+	})
 }
 
 func (s *ParkingService) GetAvailableSpots() ([]models.ParkingSpot, error) {
@@ -73,6 +103,72 @@ func (s *ParkingService) GetAvailableSpots() ([]models.ParkingSpot, error) {
 		return nil, err
 	}
 	return spots, nil
+}
+
+func (s *ParkingService) LockSpot(spotID string, reservationID string, lockDuration time.Duration) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var spot models.ParkingSpot
+		if err := tx.First(&spot, "id = ?", spotID).Error; err != nil {
+			return err
+		}
+
+		if spot.IsLocked() {
+			return ErrSpotLocked
+		}
+
+		if spot.Status != "available" {
+			return ErrSpotNotAvailable
+		}
+
+		oldVersion := spot.Version
+		now := time.Now()
+		expiresAt := now.Add(lockDuration)
+
+		result := tx.Model(&spot).Where("id = ? AND version = ?", spotID, oldVersion).Updates(map[string]interface{}{
+			"locked_by":       reservationID,
+			"locked_at":       now,
+			"lock_expires_at": expiresAt,
+			"version":         oldVersion + 1,
+			"updated_at":      now,
+		})
+
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrVersionMismatch
+		}
+
+		return nil
+	})
+}
+
+func (s *ParkingService) UnlockSpot(spotID string) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var spot models.ParkingSpot
+		if err := tx.First(&spot, "id = ?", spotID).Error; err != nil {
+			return err
+		}
+
+		oldVersion := spot.Version
+
+		result := tx.Model(&spot).Where("id = ? AND version = ?", spotID, oldVersion).Updates(map[string]interface{}{
+			"locked_by":       nil,
+			"locked_at":       nil,
+			"lock_expires_at": nil,
+			"version":         oldVersion + 1,
+			"updated_at":      time.Now(),
+		})
+
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrVersionMismatch
+		}
+
+		return nil
+	})
 }
 
 type ReservationService struct {
@@ -84,22 +180,75 @@ func NewReservationService(db *gorm.DB) *ReservationService {
 }
 
 func (s *ReservationService) CreateReservation(reservation *models.Reservation) error {
-	var spot models.ParkingSpot
-	if err := s.db.First(&spot, "id = ?", reservation.ParkingSpotID).Error; err != nil {
-		return errors.New("parking spot not found")
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var spot models.ParkingSpot
+		if err := tx.First(&spot, "id = ?", reservation.ParkingSpotID).Error; err != nil {
+			return errors.New("parking spot not found")
+		}
+
+		if spot.Status != "available" {
+			return ErrSpotNotAvailable
+		}
+
+		if spot.IsLocked() {
+			return ErrSpotLocked
+		}
+
+		if err := s.checkTimeConflict(tx, reservation.ParkingSpotID, reservation.StartTime, reservation.EndTime, ""); err != nil {
+			return err
+		}
+
+		oldVersion := spot.Version
+		lockDuration := reservation.EndTime.Sub(reservation.StartTime) + 30*time.Minute
+
+		reservation.Status = "pending"
+		if err := tx.Create(reservation).Error; err != nil {
+			return err
+		}
+
+		result := tx.Model(&spot).Where("id = ? AND version = ?", spot.ID, oldVersion).Updates(map[string]interface{}{
+			"status":          "reserved",
+			"locked_by":       reservation.ID,
+			"locked_at":       time.Now(),
+			"lock_expires_at": reservation.EndTime.Add(30 * time.Minute),
+			"version":         oldVersion + 1,
+			"updated_at":      time.Now(),
+		})
+
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrVersionMismatch
+		}
+
+		return nil
+	})
+}
+
+func (s *ReservationService) checkTimeConflict(tx *gorm.DB, spotID string, startTime, endTime time.Time, excludeReservationID string) error {
+	var conflictingReservations []models.Reservation
+	
+	query := tx.Where("parking_spot_id = ? AND status IN ? AND start_time < ? AND end_time > ?",
+		spotID,
+		[]string{"pending", "active"},
+		endTime,
+		startTime,
+	)
+
+	if excludeReservationID != "" {
+		query = query.Where("id != ?", excludeReservationID)
 	}
 
-	if spot.Status != "available" {
-		return errors.New("parking spot is not available")
-	}
-
-	spot.Status = "reserved"
-	if err := s.db.Save(&spot).Error; err != nil {
+	if err := query.Find(&conflictingReservations).Error; err != nil {
 		return err
 	}
 
-	reservation.Status = "active"
-	return s.db.Create(reservation).Error
+	if len(conflictingReservations) > 0 {
+		return fmt.Errorf("%w: spot %s has conflicting reservations", ErrTimeConflict, spotID)
+	}
+
+	return nil
 }
 
 func (s *ReservationService) GetAllReservations() ([]models.Reservation, error) {
@@ -118,28 +267,174 @@ func (s *ReservationService) GetReservationByID(id string) (*models.Reservation,
 	return &reservation, nil
 }
 
-func (s *ReservationService) CancelReservation(id string) error {
+func (s *ReservationService) GetActiveReservationByLicensePlate(licensePlate string) (*models.Reservation, error) {
 	var reservation models.Reservation
-	if err := s.db.First(&reservation, "id = ?", id).Error; err != nil {
-		return err
+	if err := s.db.Where("license_plate = ? AND status IN ?", 
+		licensePlate, []string{"pending", "active"}).First(&reservation).Error; err != nil {
+		return nil, err
+	}
+	return &reservation, nil
+}
+
+func (s *ReservationService) CheckInReservation(reservationID string) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var reservation models.Reservation
+		if err := tx.First(&reservation, "id = ?", reservationID).Error; err != nil {
+			return err
+		}
+
+		if reservation.Status != "pending" {
+			return errors.New("reservation is not pending")
+		}
+
+		now := time.Now()
+		graceEnd := reservation.StartTime.Add(time.Duration(reservation.GraceMinutes) * time.Minute)
+
+		if now.After(graceEnd) {
+			return ErrReservationExpired
+		}
+
+		reservation.Status = "active"
+		reservation.CheckInTime = &now
+
+		if err := tx.Save(&reservation).Error; err != nil {
+			return err
+		}
+
+		var spot models.ParkingSpot
+		if err := tx.First(&spot, "id = ?", reservation.ParkingSpotID).Error; err != nil {
+			return err
+		}
+
+		oldVersion := spot.Version
+		spot.Status = "occupied"
+
+		result := tx.Model(&spot).Where("id = ? AND version = ?", spot.ID, oldVersion).Updates(map[string]interface{}{
+			"status":     "occupied",
+			"version":    oldVersion + 1,
+			"updated_at": now,
+		})
+
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrVersionMismatch
+		}
+
+		return nil
+	})
+}
+
+func (s *ReservationService) CheckOutReservation(reservationID string) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var reservation models.Reservation
+		if err := tx.First(&reservation, "id = ?", reservationID).Error; err != nil {
+			return err
+		}
+
+		if reservation.Status != "active" {
+			return errors.New("reservation is not active")
+		}
+
+		now := time.Now()
+		reservation.Status = "completed"
+		reservation.CheckOutTime = &now
+
+		if err := tx.Save(&reservation).Error; err != nil {
+			return err
+		}
+
+		var spot models.ParkingSpot
+		if err := tx.First(&spot, "id = ?", reservation.ParkingSpotID).Error; err != nil {
+			return err
+		}
+
+		oldVersion := spot.Version
+
+		result := tx.Model(&spot).Where("id = ? AND version = ?", spot.ID, oldVersion).Updates(map[string]interface{}{
+			"status":          "available",
+			"locked_by":       nil,
+			"locked_at":       nil,
+			"lock_expires_at": nil,
+			"version":         oldVersion + 1,
+			"updated_at":      now,
+		})
+
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrVersionMismatch
+		}
+
+		return nil
+	})
+}
+
+func (s *ReservationService) CancelReservation(id string) error {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var reservation models.Reservation
+		if err := tx.First(&reservation, "id = ?", id).Error; err != nil {
+			return err
+		}
+
+		if reservation.Status == "completed" || reservation.Status == "cancelled" {
+			return errors.New("reservation cannot be cancelled")
+		}
+
+		reservation.Status = "cancelled"
+		if err := tx.Save(&reservation).Error; err != nil {
+			return err
+		}
+
+		var spot models.ParkingSpot
+		if err := tx.First(&spot, "id = ?", reservation.ParkingSpotID).Error; err != nil {
+			return err
+		}
+
+		oldVersion := spot.Version
+
+		result := tx.Model(&spot).Where("id = ? AND version = ?", spot.ID, oldVersion).Updates(map[string]interface{}{
+			"status":          "available",
+			"locked_by":       nil,
+			"locked_at":       nil,
+			"lock_expires_at": nil,
+			"version":         oldVersion + 1,
+			"updated_at":      time.Now(),
+		})
+
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrVersionMismatch
+		}
+
+		return nil
+	})
+}
+
+func (s *ReservationService) CleanupExpiredReservations() (int64, error) {
+	var expiredReservations []models.Reservation
+	
+	if err := s.db.Where("status IN ? AND check_in_time IS NULL", 
+		[]string{"pending", "active"}).Find(&expiredReservations).Error; err != nil {
+		return 0, err
 	}
 
-	if reservation.Status == "completed" || reservation.Status == "cancelled" {
-		return errors.New("reservation cannot be cancelled")
+	var cleanedCount int64
+
+	for _, reservation := range expiredReservations {
+		graceEnd := reservation.StartTime.Add(time.Duration(reservation.GraceMinutes) * time.Minute)
+		if time.Now().After(graceEnd) {
+			if err := s.CancelReservation(reservation.ID); err == nil {
+				cleanedCount++
+			}
+		}
 	}
 
-	reservation.Status = "cancelled"
-	if err := s.db.Save(&reservation).Error; err != nil {
-		return err
-	}
-
-	var spot models.ParkingSpot
-	if err := s.db.First(&spot, "id = ?", reservation.ParkingSpotID).Error; err == nil {
-		spot.Status = "available"
-		s.db.Save(&spot)
-	}
-
-	return nil
+	return cleanedCount, nil
 }
 
 type OrderService struct {
@@ -171,22 +466,24 @@ func (s *OrderService) CreateOrder(order *models.Order) error {
 }
 
 func (s *OrderService) PayOrder(id string, paymentMethod string, paidAmount float64) error {
-	var order models.Order
-	if err := s.db.First(&order, "id = ?", id).Error; err != nil {
-		return err
-	}
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var order models.Order
+		if err := tx.First(&order, "id = ?", id).Error; err != nil {
+			return err
+		}
 
-	if order.Status == "paid" || order.Status == "completed" {
-		return errors.New("order already paid")
-	}
+		if order.Status == "paid" || order.Status == "completed" {
+			return errors.New("order already paid")
+		}
 
-	now := time.Now()
-	order.Status = "paid"
-	order.PaymentMethod = paymentMethod
-	order.PaidAmount = paidAmount
-	order.PaidTime = &now
+		now := time.Now()
+		order.Status = "paid"
+		order.PaymentMethod = paymentMethod
+		order.PaidAmount = paidAmount
+		order.PaidTime = &now
 
-	return s.db.Save(&order).Error
+		return tx.Save(&order).Error
+	})
 }
 
 type AccessControlService struct {
@@ -198,98 +495,238 @@ func NewAccessControlService(db *gorm.DB) *AccessControlService {
 }
 
 func (s *AccessControlService) VehicleEntry(licensePlate string, deviceID string, confidence float64) (*models.AccessLog, error) {
-	spot, err := s.findAvailableSpot()
+	return s.vehicleEntryWithReservation(licensePlate, deviceID, confidence, "")
+}
+
+func (s *AccessControlService) vehicleEntryWithReservation(licensePlate string, deviceID string, confidence float64, reservationID string) (*models.AccessLog, error) {
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var spot *models.ParkingSpot
+		var reservation *models.Reservation
+		var err error
+
+		if reservationID == "" {
+			reservation, err = s.findActiveReservationByPlate(tx, licensePlate)
+			if err == nil && reservation != nil {
+				reservationID = reservation.ID
+			}
+		}
+
+		if reservationID != "" {
+			spot, err = s.getAndValidateReservedSpot(tx, reservationID, licensePlate)
+			if err != nil {
+				return err
+			}
+		} else {
+			spot, err = s.findAvailableSpot(tx)
+			if err != nil {
+				return err
+			}
+		}
+
+		now := time.Now()
+		accessLog := &models.AccessLog{
+			Type:          "entry",
+			LicensePlate:  licensePlate,
+			DeviceID:      deviceID,
+			EntryTime:     now,
+			Confidence:    confidence,
+			Status:        "success",
+			ReservationID: reservationID,
+		}
+
+		if err := tx.Create(accessLog).Error; err != nil {
+			return err
+		}
+
+		oldVersion := spot.Version
+		spot.Status = "occupied"
+
+		result := tx.Model(spot).Where("id = ? AND version = ?", spot.ID, oldVersion).Updates(map[string]interface{}{
+			"status":     "occupied",
+			"version":    oldVersion + 1,
+			"updated_at": now,
+		})
+
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrVersionMismatch
+		}
+
+		order := &models.Order{
+			LicensePlate:  licensePlate,
+			ParkingSpotID: spot.ID,
+			ReservationID: reservationID,
+			EntryTime:     now,
+			Status:        "unpaid",
+			TotalAmount:   0,
+		}
+
+		if err := tx.Create(order).Error; err != nil {
+			return err
+		}
+
+		if reservationID != "" {
+			var res models.Reservation
+			if err := tx.First(&res, "id = ?", reservationID).Error; err == nil {
+				if res.Status == "pending" {
+					res.Status = "active"
+					res.CheckInTime = &now
+					tx.Save(&res)
+				}
+			}
+		}
+
+		return nil
+	}).(*models.AccessLog), nil
+}
+
+func (s *AccessControlService) findActiveReservationByPlate(tx *gorm.DB, licensePlate string) (*models.Reservation, error) {
+	var reservation models.Reservation
+	if err := tx.Where("license_plate = ? AND status IN ?", 
+		licensePlate, []string{"pending", "active"}).First(&reservation).Error; err != nil {
+		return nil, err
+	}
+	return &reservation, nil
+}
+
+func (s *AccessControlService) getAndValidateReservedSpot(tx *gorm.DB, reservationID string, licensePlate string) (*models.ParkingSpot, error) {
+	var reservation models.Reservation
+	if err := tx.First(&reservation, "id = ?", reservationID).Error; err != nil {
+		return nil, errors.New("reservation not found")
+	}
+
+	if reservation.LicensePlate != licensePlate {
+		return nil, errors.New("license plate does not match reservation")
+	}
+
+	graceEnd := reservation.StartTime.Add(time.Duration(reservation.GraceMinutes) * time.Minute)
+	if time.Now().After(graceEnd) && reservation.Status == "pending" {
+		return nil, ErrReservationExpired
+	}
+
+	var spot models.ParkingSpot
+	if err := tx.First(&spot, "id = ?", reservation.ParkingSpotID).Error; err != nil {
+		return nil, errors.New("parking spot not found")
+	}
+
+	if spot.Status != "reserved" && spot.Status != "available" {
+		return nil, ErrSpotNotAvailable
+	}
+
+	return &spot, nil
+}
+
+func (s *AccessControlService) findAvailableSpot(tx *gorm.DB) (*models.ParkingSpot, error) {
+	var spot models.ParkingSpot
+	
+	err := tx.Transaction(func(tx2 *gorm.DB) error {
+		result := tx2.Raw(`
+			SELECT * FROM parking_spots 
+			WHERE status = 'available' AND (locked_by IS NULL OR lock_expires_at < ?)
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		`, time.Now()).Scan(&spot)
+
+		if result.Error != nil {
+			return result.Error
+		}
+
+		if spot.ID == "" {
+			return errors.New("no available parking spots")
+		}
+
+		return nil
+	})
+
 	if err != nil {
 		return nil, err
 	}
 
-	accessLog := &models.AccessLog{
-		Type:         "entry",
-		LicensePlate: licensePlate,
-		DeviceID:     deviceID,
-		EntryTime:    time.Now(),
-		Confidence:   confidence,
-		Status:       "success",
-	}
-
-	if err := s.db.Create(accessLog).Error; err != nil {
-		return nil, err
-	}
-
-	spot.Status = "occupied"
-	if err := s.db.Save(spot).Error; err != nil {
-		return nil, err
-	}
-
-	order := &models.Order{
-		LicensePlate:  licensePlate,
-		ParkingSpotID: spot.ID,
-		EntryTime:     time.Now(),
-		Status:        "unpaid",
-		TotalAmount:   0,
-	}
-
-	if err := s.db.Create(order).Error; err != nil {
-		return nil, err
-	}
-
-	return accessLog, nil
+	return &spot, nil
 }
 
 func (s *AccessControlService) VehicleExit(licensePlate string, deviceID string, confidence float64) (*models.AccessLog, error) {
-	var order models.Order
-	if err := s.db.Where("license_plate = ? AND status = ?", licensePlate, "unpaid").First(&order).Error; err != nil {
-		return nil, errors.New("no active parking record found")
-	}
+	return s.db.Transaction(func(tx *gorm.DB) error {
+		var order models.Order
+		if err := tx.Where("license_plate = ? AND status = ?", licensePlate, "unpaid").First(&order).Error; err != nil {
+			return ErrNoActiveParking
+		}
 
-	now := time.Now()
-	duration := now.Sub(order.EntryTime)
-	minutes := int64(duration.Minutes())
+		now := time.Now()
+		duration := now.Sub(order.EntryTime)
+		minutes := int64(duration.Minutes())
 
-	billingService := NewBillingService(s.db)
-	totalAmount, err := billingService.CalculateFee(minutes, "standard")
-	if err != nil {
-		return nil, err
-	}
+		enhancedBillingService := NewEnhancedBillingService(tx)
+		billingResult, err := enhancedBillingService.CalculateParkingFee(order.EntryTime, now, "standard")
+		if err != nil {
+			return err
+		}
 
-	order.ExitTime = &now
-	order.ParkingDuration = minutes
-	order.TotalAmount = totalAmount
-	order.Status = "unpaid"
+		billingDetailsJSON, _ := json.Marshal(billingResult)
 
-	if err := s.db.Save(&order).Error; err != nil {
-		return nil, err
-	}
+		order.ExitTime = &now
+		order.ParkingDuration = minutes
+		order.TotalAmount = billingResult.FinalAmount
+		order.Status = "unpaid"
+		order.BillingDetails = string(billingDetailsJSON)
 
-	accessLog := &models.AccessLog{
-		Type:         "exit",
-		LicensePlate: licensePlate,
-		DeviceID:     deviceID,
-		EntryTime:    order.EntryTime,
-		ExitTime:     &now,
-		Confidence:   confidence,
-		Status:       "success",
-	}
+		if err := tx.Save(&order).Error; err != nil {
+			return err
+		}
 
-	if err := s.db.Create(accessLog).Error; err != nil {
-		return nil, err
-	}
+		accessLog := &models.AccessLog{
+			Type:          "exit",
+			LicensePlate:  licensePlate,
+			DeviceID:      deviceID,
+			EntryTime:     order.EntryTime,
+			ExitTime:      &now,
+			Confidence:    confidence,
+			Status:        "success",
+			ReservationID: order.ReservationID,
+		}
 
-	var spot models.ParkingSpot
-	if err := s.db.First(&spot, "id = ?", order.ParkingSpotID).Error; err == nil {
-		spot.Status = "available"
-		s.db.Save(&spot)
-	}
+		if err := tx.Create(accessLog).Error; err != nil {
+			return err
+		}
 
-	return accessLog, nil
-}
+		var spot models.ParkingSpot
+		if err := tx.First(&spot, "id = ?", order.ParkingSpotID).Error; err != nil {
+			return err
+		}
 
-func (s *AccessControlService) findAvailableSpot() (*models.ParkingSpot, error) {
-	var spot models.ParkingSpot
-	if err := s.db.Where("status = ?", "available").First(&spot).Error; err != nil {
-		return nil, errors.New("no available parking spots")
-	}
-	return &spot, nil
+		oldVersion := spot.Version
+
+		result := tx.Model(&spot).Where("id = ? AND version = ?", spot.ID, oldVersion).Updates(map[string]interface{}{
+			"status":          "available",
+			"locked_by":       nil,
+			"locked_at":       nil,
+			"lock_expires_at": nil,
+			"version":         oldVersion + 1,
+			"updated_at":      now,
+		})
+
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return ErrVersionMismatch
+		}
+
+		if order.ReservationID != "" {
+			var res models.Reservation
+			if err := tx.First(&res, "id = ?", order.ReservationID).Error; err == nil {
+				if res.Status == "active" {
+					res.Status = "completed"
+					res.CheckOutTime = &now
+					tx.Save(&res)
+				}
+			}
+		}
+
+		return nil
+	}).(*models.AccessLog), nil
 }
 
 func (s *AccessControlService) GetAccessLogs() ([]models.AccessLog, error) {
@@ -308,6 +745,21 @@ func NewBillingService(db *gorm.DB) *BillingService {
 	return &BillingService{db: db}
 }
 
+type BillingPeriod struct {
+	StartTime  time.Time
+	EndTime    time.Time
+	Duration   time.Duration
+	PeriodType string
+	HourlyRate float64
+}
+
+type DetailedBillingResult struct {
+	Periods       []BillingPeriod
+	DailyTotals   map[string]float64
+	TotalAmount   float64
+	TotalDuration time.Duration
+}
+
 func (s *BillingService) GetAllBillingRules() ([]models.BillingRule, error) {
 	var rules []models.BillingRule
 	if err := s.db.Where("status = ?", "active").Find(&rules).Error; err != nil {
@@ -324,20 +776,34 @@ func (s *BillingService) GetBillingRuleByID(id string) (*models.BillingRule, err
 	return &rule, nil
 }
 
-func (s *BillingService) CalculateFee(minutes int64, spotType string) (float64, error) {
+func (s *BillingService) getActiveRule(spotType string) (*models.BillingRule, error) {
 	var rule models.BillingRule
 	if err := s.db.Where("spot_type = ? AND status = ?", spotType, "active").First(&rule).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			rule = models.BillingRule{
+			return &models.BillingRule{
 				FirstHour:   10.0,
 				HourlyRate:  8.0,
 				DailyMax:    80.0,
 				MinCharge:   5.0,
 				GracePeriod: 15,
-			}
-		} else {
-			return 0, err
+				PeakStart:   "07:00",
+				PeakEnd:     "09:00",
+				PeakRate:    12.0,
+				NightStart:  "22:00",
+				NightEnd:    "06:00",
+				NightRate:   5.0,
+				HolidayRate: 10.0,
+			}, nil
 		}
+		return nil, err
+	}
+	return &rule, nil
+}
+
+func (s *BillingService) CalculateFee(minutes int64, spotType string) (float64, error) {
+	rule, err := s.getActiveRule(spotType)
+	if err != nil {
+		return 0, err
 	}
 
 	if minutes <= int64(rule.GracePeriod) {
@@ -362,7 +828,183 @@ func (s *BillingService) CalculateFee(minutes int64, spotType string) (float64, 
 		fee = rule.DailyMax
 	}
 
-	return fee, nil
+	return math.Round(fee*100) / 100, nil
+}
+
+func (s *BillingService) CalculateDetailedFee(entryTime, exitTime time.Time, spotType string) (float64, []BillingPeriod, error) {
+	rule, err := s.getActiveRule(spotType)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	duration := exitTime.Sub(entryTime)
+	totalMinutes := int64(duration.Minutes())
+
+	if totalMinutes <= int64(rule.GracePeriod) {
+		return 0, []BillingPeriod{}, nil
+	}
+
+	periods := s.splitIntoPeriods(entryTime, exitTime, rule)
+
+	dailyTotals := make(map[string]float64)
+	var totalAmount float64
+
+	for _, period := range periods {
+		periodMinutes := int64(period.Duration.Minutes())
+		periodHours := float64(periodMinutes) / 60.0
+		
+		var periodFee float64
+		if periodHours <= 1 {
+			periodFee = rule.FirstHour
+		} else {
+			periodFee = rule.FirstHour + float64(int(periodHours-1+0.999))*period.HourlyRate
+		}
+
+		dateKey := period.StartTime.Format("2006-01-02")
+		dailyTotals[dateKey] += periodFee
+		totalAmount += periodFee
+	}
+
+	for dateKey, dailyTotal := range dailyTotals {
+		if dailyTotal > rule.DailyMax {
+			discount := dailyTotal - rule.DailyMax
+			totalAmount -= discount
+			dailyTotals[dateKey] = rule.DailyMax
+		}
+	}
+
+	if totalAmount < rule.MinCharge {
+		totalAmount = rule.MinCharge
+	}
+
+	return math.Round(totalAmount*100) / 100, periods, nil
+}
+
+func (s *BillingService) splitIntoPeriods(entryTime, exitTime time.Time, rule *models.BillingRule) []BillingPeriod {
+	var periods []BillingPeriod
+
+	current := entryTime
+	for current.Before(exitTime) {
+		periodEnd := s.getNextPeriodBoundary(current, exitTime, rule)
+		
+		periodType, hourlyRate := s.getPeriodInfo(current, rule)
+		
+		duration := periodEnd.Sub(current)
+		if duration > 0 {
+			periods = append(periods, BillingPeriod{
+				StartTime:  current,
+				EndTime:    periodEnd,
+				Duration:   duration,
+				PeriodType: periodType,
+				HourlyRate: hourlyRate,
+			})
+		}
+
+		current = periodEnd
+	}
+
+	return periods
+}
+
+func (s *BillingService) getNextPeriodBoundary(current, exitTime time.Time, rule *models.BillingRule) time.Time {
+	boundaries := []time.Time{}
+
+	dayEnd := time.Date(current.Year(), current.Month(), current.Day()+1, 0, 0, 0, 0, current.Location())
+	boundaries = append(boundaries, dayEnd)
+
+	if rule.PeakStart != "" && rule.PeakEnd != "" {
+		peakStart, _ := parseTimeOfDay(current, rule.PeakStart)
+		peakEnd, _ := parseTimeOfDay(current, rule.PeakEnd)
+		
+		if current.Before(peakStart) {
+			boundaries = append(boundaries, peakStart)
+		} else if current.Before(peakEnd) {
+			boundaries = append(boundaries, peakEnd)
+		}
+	}
+
+	if rule.NightStart != "" && rule.NightEnd != "" {
+		nightStart, _ := parseTimeOfDay(current, rule.NightStart)
+		nightEnd, _ := parseTimeOfDay(current.Add(24*time.Hour), rule.NightEnd)
+		
+		if current.Before(nightStart) {
+			boundaries = append(boundaries, nightStart)
+		} else if current.Before(nightEnd) {
+			boundaries = append(boundaries, nightEnd)
+		}
+	}
+
+	nextBoundary := exitTime
+	for _, b := range boundaries {
+		if b.After(current) && b.Before(nextBoundary) {
+			nextBoundary = b
+		}
+	}
+
+	return nextBoundary
+}
+
+func (s *BillingService) getPeriodInfo(t time.Time, rule *models.BillingRule) (string, float64) {
+	if s.isHoliday(t) && rule.HolidayRate > 0 {
+		return "holiday", rule.HolidayRate
+	}
+
+	if rule.NightStart != "" && rule.NightEnd != "" {
+		nightStart, _ := parseTimeOfDay(t, rule.NightStart)
+		nightEnd, _ := parseTimeOfDay(t.Add(24*time.Hour), rule.NightEnd)
+		
+		if (t.After(nightStart) || t.Equal(nightStart)) && t.Before(nightEnd) {
+			return "night", rule.NightRate
+		}
+	}
+
+	if rule.PeakStart != "" && rule.PeakEnd != "" {
+		peakStart, _ := parseTimeOfDay(t, rule.PeakStart)
+		peakEnd, _ := parseTimeOfDay(t, rule.PeakEnd)
+		
+		if t.After(peakStart) && t.Before(peakEnd) {
+			return "peak", rule.PeakRate
+		}
+	}
+
+	return "normal", rule.HourlyRate
+}
+
+func (s *BillingService) isHoliday(t time.Time) bool {
+	month := int(t.Month())
+	day := t.Day()
+
+	holidays := [][2]int{
+		{1, 1},
+		{10, 1},
+		{5, 1},
+	}
+
+	for _, holiday := range holidays {
+		if month == holiday[0] && day == holiday[1] {
+			return true
+		}
+	}
+
+	weekday := t.Weekday()
+	if weekday == time.Saturday || weekday == time.Sunday {
+		return true
+	}
+
+	return false
+}
+
+func parseTimeOfDay(base time.Time, timeStr string) (time.Time, error) {
+	parts := strings.Split(timeStr, ":")
+	if len(parts) < 2 {
+		return base, errors.New("invalid time format")
+	}
+
+	var hour, minute int
+	fmt.Sscanf(parts[0], "%d", &hour)
+	fmt.Sscanf(parts[1], "%d", &minute)
+
+	return time.Date(base.Year(), base.Month(), base.Day(), hour, minute, 0, 0, base.Location()), nil
 }
 
 func (s *BillingService) UpdateBillingRule(id string, updates map[string]interface{}) error {
@@ -428,9 +1070,9 @@ func (s *DeviceService) GetDeviceStatus(id string) (map[string]interface{}, erro
 	}
 
 	return map[string]interface{}{
-		"device_id":     device.ID,
-		"device_no":     device.DeviceNo,
-		"status":        device.Status,
+		"device_id":      device.ID,
+		"device_no":      device.DeviceNo,
+		"status":         device.Status,
 		"last_active_at": device.LastActiveAt,
 	}, nil
 }

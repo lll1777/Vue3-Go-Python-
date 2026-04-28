@@ -8,8 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func SetupRoutes(router *gin.Engine) {
-	router.Use(cors.New(cors.Config{
+func SetupRoutes(router *gin.Engine) {	router.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"*"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
@@ -46,8 +45,12 @@ func SetupRoutes(router *gin.Engine) {
 		{
 			reservations.POST("", reservationController.CreateReservation)
 			reservations.GET("", reservationController.GetReservations)
+			reservations.GET("/active", reservationController.GetActiveReservationByPlate)
 			reservations.GET("/:id", reservationController.GetReservationByID)
 			reservations.PUT("/:id/cancel", reservationController.CancelReservation)
+			reservations.POST("/:id/check-in", reservationController.CheckInReservation)
+			reservations.POST("/:id/check-out", reservationController.CheckOutReservation)
+			reservations.POST("/cleanup-expired", reservationController.CleanupExpiredReservations)
 		}
 
 		orders := api.Group("/orders")
@@ -68,6 +71,7 @@ func SetupRoutes(router *gin.Engine) {
 		billing := api.Group("/billing")
 		{
 			billing.POST("/calculate", billingController.CalculateFee)
+			billing.POST("/calculate-detailed", billingController.CalculateDetailedFee)
 			billing.GET("/rules", billingController.GetBillingRules)
 			billing.PUT("/rules/:id", billingController.UpdateBillingRule)
 		}
