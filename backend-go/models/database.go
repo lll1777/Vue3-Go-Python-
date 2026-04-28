@@ -35,6 +35,7 @@ func AutoMigrate() {
 		&Reservation{},
 		&Order{},
 		&BillingRule{},
+		&BillingDetail{},
 		&Device{},
 		&AccessLog{},
 	)
